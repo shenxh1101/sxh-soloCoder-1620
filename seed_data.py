@@ -1,12 +1,14 @@
 from datetime import datetime, timedelta
 import equipment_manager
 import rental_manager
+import reservation_manager
+import settlement_manager
 from database import init_db
 
 
 def seed_sample_data():
     init_db()
-    print("开始初始化示例数据...\n")
+    print("开始初始化示例数据 v3.0...\n")
 
     equipments = [
         ('WJ-001', '挖掘机', '卡特彼勒320D', 280.0, 200),
@@ -79,7 +81,7 @@ def seed_sample_data():
             'rental_mode': '按小时',
             'hourly_rate': 220,
             'actual': {
-                'return_offset': 7,
+                'return_offset': 5,
                 'return_hours': 524,
             },
         },
@@ -124,6 +126,7 @@ def seed_sample_data():
         },
     ]
 
+    created_rentals = []
     for r in rentals:
         eq = eq_map[r['code']]
         start_date = (today - timedelta(days=r['start_offset'])).strftime('%Y-%m-%d')
@@ -147,9 +150,86 @@ def seed_sample_data():
             actual_return_date = (today - timedelta(days=r['actual']['return_offset'])).strftime('%Y-%m-%d')
             ok, result = rental_manager.return_equipment(rid, actual_return_date, r['actual']['return_hours'])
             if ok:
-                print(f"    设备已归还，总费用: ¥{result['total_amount']:.2f}")
+                sid = result.get('settlement_id')
+                setl_info = f" (结算单#{sid})" if sid else ""
+                print(f"    ✅ 设备已归还，总费用: ¥{result['total_amount']:.2f}{setl_info}")
+                if sid and r['customer_idx'] in (0, 3):
+                    ok_p, msg_p = settlement_manager.record_payment(sid, result['total_amount'], '示例数据：全额结清')
+                    if ok_p:
+                        print(f"    ✅ {msg_p}")
             else:
-                print(f"    归还失败: {result}")
+                print(f"    ❌ 归还失败: {result}")
+        created_rentals.append((rid, r))
+
+    print()
+
+    print("  --- 示例预约数据 ---")
+    reservations = [
+        {
+            'customer_idx': 0,
+            'code': 'ZZ-002',
+            'start_offset': -3,
+            'duration_days': 4,
+            'mode': '按天',
+            'daily': 1680,
+            'confirmed': True,
+        },
+        {
+            'customer_idx': 2,
+            'code': 'YL-002',
+            'start_offset': -7,
+            'duration_days': 5,
+            'mode': '按天',
+            'daily': 1520,
+            'confirmed': False,
+        },
+        {
+            'customer_idx': 4,
+            'code': 'TT-002',
+            'start_offset': -10,
+            'duration_days': 6,
+            'mode': '按天',
+            'daily': 2080,
+            'confirmed': True,
+        },
+    ]
+    created_reservations = []
+    for rv in reservations:
+        eq = eq_map[rv['code']]
+        start_d = (today + timedelta(days=rv['start_offset'])).strftime('%Y-%m-%d')
+        end_d = (today + timedelta(days=rv['start_offset']) + timedelta(days=rv['duration_days'])).strftime('%Y-%m-%d')
+        ok, rvid, msg = reservation_manager.create_reservation(
+            customer_ids[rv['customer_idx']], eq['id'],
+            start_d, end_d, rv['mode'],
+            expected_daily_rate=rv.get('daily'),
+            expected_hourly_rate=rv.get('hourly'),
+            remarks='示例预约数据'
+        )
+        if ok:
+            if rv['confirmed']:
+                reservation_manager.confirm_reservation(rvid)
+            print(f"  ✅ 预约#{rvid} {eq['code']} {start_d}~{end_d} {'[已确认]' if rv['confirmed'] else '[待确认]'}")
+            created_reservations.append((rvid, rv))
+        else:
+            print(f"  ❌ 预约失败: {msg[:60]}")
+
+    if created_reservations:
+        rvid, rv = created_reservations[0]
+        eq = eq_map[rv['code']]
+        ok_conv, rental_id, msg_conv = reservation_manager.convert_reservation_to_rental(
+            rvid, eq['total_hours'] + 5, '从示例预约转换而来'
+        )
+        if ok_conv:
+            print(f"\n  ✅ 预约#{rvid} 闭环转租赁成功: {msg_conv}")
+            ret_date = (today + timedelta(days=rv['start_offset'] + rv['duration_days'] - 1)).strftime('%Y-%m-%d')
+            ok_ret, result_ret = rental_manager.return_equipment(
+                rental_id, ret_date, eq['total_hours'] + 5 + rv['duration_days'] * 7
+            )
+            if ok_ret:
+                sid = result_ret.get('settlement_id')
+                print(f"  ✅ 模拟归还并结算完成，总费用 ¥{result_ret['total_amount']:.2f} 结算单#{sid}")
+        else:
+            print(f"\n  ⚠️  预约转租赁: {msg_conv}")
 
     print()
 
@@ -162,10 +242,22 @@ def seed_sample_data():
 
     for code, m_date, hours, m_type, cost in maintenance_records:
         eq = eq_map[code]
-        ok, msg = equipment_manager.add_maintenance_record(eq['id'], m_date, hours, m_type, cost)
-        print(f"  {code}: {msg}")
+        ok, info, msg = equipment_manager.add_maintenance_record(eq['id'], m_date, hours, m_type, cost)
+        extra = f"，状态 {info['prev_status']}→{info['new_status']}" if ok and info else ""
+        print(f"  {code}: {msg}{extra}")
 
-    print("\n示例数据初始化完成！")
+    equipment_manager.refresh_all_maintenance_statuses()
+
+    print()
+    print("=" * 60)
+    print("  ✅ 示例数据加载完成！")
+    print(f"    - 设备: {len(equipments)} 台")
+    print(f"    - 客户: {len(customers)} 家")
+    print(f"    - 租赁: {len(created_rentals)} 笔")
+    print(f"    - 预约: {len(reservations)} 条（含1条闭环转租赁示例）")
+    print(f"    - 保养: {len(maintenance_records)} 条")
+    print(f"    - 结算单: 已为已归还租赁自动生成")
+    print("=" * 60)
 
 
 if __name__ == '__main__':

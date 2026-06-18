@@ -92,16 +92,31 @@ def convert_reservation_to_rental(reservation_id, start_hours, remarks=''):
         return False, None, "预约不存在"
     if r['status'] not in ('待确认', '已确认'):
         return False, None, f"当前状态 [{r['status']}] 无法转为租赁"
+
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE reservation SET status = '处理中' WHERE id = ?", (reservation_id,))
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        return False, None, f"更新预约状态失败: {e}"
+    conn.close()
+
     eq = equipment_manager.get_equipment_by_id(r['equipment_id'])
     ok, avail_msg = equipment_manager.is_available_for_rent(r['equipment_id'])
     if not ok:
+        reservation_manager_back_to_pending(reservation_id)
         return False, None, avail_msg
+
     ok, msg, conflicts = equipment_manager.check_time_conflicts(
         r['equipment_id'], r['start_date'], r['end_date'],
         exclude_reservation_id=reservation_id
     )
     if not ok:
+        reservation_manager_back_to_pending(reservation_id)
         return False, None, f"时间冲突:\n{msg}"
+
     ok, rid, create_msg = rental_manager.create_rental(
         customer_id=r['customer_id'],
         equipment_id=r['equipment_id'],
@@ -111,12 +126,41 @@ def convert_reservation_to_rental(reservation_id, start_hours, remarks=''):
         rental_mode=r['rental_mode'],
         daily_rate=r['expected_daily_rate'],
         hourly_rate=r['expected_hourly_rate'],
-        remarks=(r['remarks'] or '') + (f"\n{remarks}" if remarks else '')
+        remarks=(r['remarks'] or '') + (f"\n{remarks}" if remarks else ''),
+        exclude_reservation_id=reservation_id
     )
     if not ok:
+        reservation_manager_back_to_pending(reservation_id)
         return False, None, create_msg
-    update_reservation_status(reservation_id, '已转租赁')
+
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "UPDATE reservation SET status = '已转租赁', converted_rental_id = ? WHERE id = ?",
+            (rid, reservation_id)
+        )
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        return True, rid, f"租赁已创建(ID:{rid})，但预约状态更新失败: {e}"
+    conn.close()
     return True, rid, f"预约已转为租赁，租赁ID: {rid}"
+
+
+def reservation_manager_back_to_pending(reservation_id):
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "UPDATE reservation SET status = '待确认' WHERE id = ? AND status = '处理中'",
+            (reservation_id,)
+        )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
 
 
 def list_reservations(status=None, customer_id=None, equipment_id=None):

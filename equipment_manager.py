@@ -399,3 +399,128 @@ def get_maintenance_cost_summary(year=None, month=None):
         'by_equipment': by_equipment,
         'records': records,
     }
+
+
+import calendar as _calendar
+
+
+def get_equipment_calendar(equipment_id, year, month):
+    _, days_in_month = _calendar.monthrange(year, month)
+    month_start = _parse_date(f"{year}-{month:02d}-01")
+    month_end = _parse_date(f"{year}-{month:02d}-{days_in_month}")
+
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, start_date,
+               COALESCE(actual_return_date, expected_return_date) as end_date,
+               status
+        FROM rental
+        WHERE equipment_id = ?
+          AND status != '已取消'
+          AND COALESCE(actual_return_date, expected_return_date) >= ?
+          AND start_date <= ?
+    ''', (equipment_id, month_start.strftime('%Y-%m-%d'), month_end.strftime('%Y-%m-%d')))
+    rentals = [dict(row) for row in cursor.fetchall()]
+
+    cursor.execute('''
+        SELECT id, start_date, end_date, status
+        FROM reservation
+        WHERE equipment_id = ?
+          AND status IN ('待确认', '已确认')
+          AND end_date >= ?
+          AND start_date <= ?
+    ''', (equipment_id, month_start.strftime('%Y-%m-%d'), month_end.strftime('%Y-%m-%d')))
+    reservations = [dict(row) for row in cursor.fetchall()]
+
+    cursor.execute('''
+        SELECT id, maintenance_date, hours_at_maintenance, type
+        FROM maintenance
+        WHERE equipment_id = ?
+          AND strftime('%Y', maintenance_date) = ?
+          AND strftime('%m', maintenance_date) = ?
+    ''', (equipment_id, f'{year:04d}', f'{month:02d}'))
+    maint_records = [dict(row) for row in cursor.fetchall()]
+    maint_dates = set(m['maintenance_date'] for m in maint_records)
+
+    conn.close()
+
+    eq = get_equipment_by_id(equipment_id)
+
+    calendar = []
+    for day in range(1, days_in_month + 1):
+        d = _parse_date(f"{year}-{month:02d}-{day:02d}")
+        d_str = d.strftime('%Y-%m-%d')
+
+        if d_str in maint_dates:
+            status = '保养'
+            detail = [f"保养记录: {', '.join(m['type'] for m in maint_records if m['maintenance_date'] == d_str)}"]
+        else:
+            status = '空闲'
+            detail = []
+
+        for r in rentals:
+            rs = _parse_date(r['start_date'])
+            re = _parse_date(r['end_date'])
+            if rs <= d <= re:
+                status = '在租' if r['status'] == '在租' else '已归还'
+                detail.append(f"租赁#{r['id']}({r['status']})")
+                break
+
+        if status in ('空闲',):
+            for rv in reservations:
+                rs = _parse_date(rv['start_date'])
+                re = _parse_date(rv['end_date'])
+                if rs <= d <= re:
+                    status = '预约'
+                    detail.append(f"预约#{rv['id']}({rv['status']})")
+                    break
+
+        calendar.append({
+            'day': day,
+            'date': d_str,
+            'status': status,
+            'detail': detail,
+            'weekday': d.weekday(),
+        })
+
+    return {
+        'equipment': eq,
+        'year': year,
+        'month': month,
+        'days_in_month': days_in_month,
+        'calendar': calendar,
+    }
+
+
+def get_type_availability_matrix(eq_type, year, month):
+    _, days_in_month = _calendar.monthrange(year, month)
+    month_start_str = f"{year}-{month:02d}-01"
+    month_end_str = f"{year}-{month:02d}-{days_in_month}"
+
+    equipments = list_equipment(eq_type=eq_type)
+    result = []
+
+    for eq in equipments:
+        cal = get_equipment_calendar(eq['id'], year, month)
+        free_days = []
+        for day_info in cal['calendar']:
+            if day_info['status'] == '空闲':
+                free_days.append(day_info['day'])
+        result.append({
+            'code': eq['code'],
+            'model': eq['model'],
+            'status': eq['status'],
+            'free_days': free_days,
+            'free_count': len(free_days),
+        })
+
+    result.sort(key=lambda x: (-x['free_count'], x['code']))
+
+    return {
+        'eq_type': eq_type,
+        'year': year,
+        'month': month,
+        'days_in_month': days_in_month,
+        'equipments': result,
+    }

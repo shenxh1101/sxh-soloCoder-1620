@@ -1,6 +1,7 @@
 import sys
 import os
 from datetime import datetime
+import calendar
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -9,6 +10,7 @@ import equipment_manager
 import rental_manager
 import reservation_manager
 import report_manager
+import settlement_manager
 import seed_data
 
 
@@ -118,6 +120,178 @@ def show_maintenance_alerts():
         print()
 
 
+def display_equipment_calendar():
+    code = input("设备编号: ").strip()
+    eq = equipment_manager.get_equipment_by_code(code)
+    if not eq:
+        print("设备不存在")
+        return
+    now = datetime.now()
+    year = input_int(f"年份(默认{now.year}): ", 2000, 2100) or now.year
+    month = input_int(f"月份(默认{now.month}): ", 1, 12) or now.month
+    cal = equipment_manager.get_equipment_calendar(eq['id'], year, month)
+    _, days = calendar.monthrange(year, month)
+
+    status_color = {
+        '空闲': '·',
+        '预约': '预',
+        '在租': '租',
+        '已归还': '归',
+        '保养': '保',
+    }
+    weekday_names = ['一', '二', '三', '四', '五', '六', '日']
+
+    print(f"\n📅 {eq['code']} - {eq['type']} {eq['model']} | {year}年{month}月排期日历")
+    print(f"  {'  '.join(f'[{w}]' for w in weekday_names)}")
+    first_weekday = calendar.weekday(year, month, 1)
+    line = '  ' + '    ' * first_weekday
+    for day_info in cal['calendar']:
+        mark = status_color.get(day_info['status'], '?')
+        cell = f"{day_info['day']:>2}{mark}"
+        line += f" {cell}"
+        if day_info['weekday'] == 6:
+            print(line)
+            line = '  '
+    if line.strip():
+        print(line)
+    print()
+    print("图例:  ·空闲   预预约   租在租   归已归还   保保养")
+    print()
+    print("明细:")
+    for day_info in cal['calendar']:
+        if day_info['status'] != '空闲':
+            detail = ', '.join(day_info['detail']) if day_info['detail'] else ''
+            print(f"  {day_info['date']} [{day_info['status']}] {detail}")
+
+
+def display_type_availability():
+    print("设备类型:", ', '.join(equipment_manager.EQUIPMENT_TYPES))
+    eq_type = input("选择类型: ").strip()
+    if eq_type not in equipment_manager.EQUIPMENT_TYPES:
+        print("类型错误")
+        return
+    now = datetime.now()
+    year = input_int(f"年份(默认{now.year}): ", 2000, 2100) or now.year
+    month = input_int(f"月份(默认{now.month}): ", 1, 12) or now.month
+    matrix = equipment_manager.get_type_availability_matrix(eq_type, year, month)
+    _, days = calendar.monthrange(year, month)
+
+    print(f"\n📊 {eq_type} | {year}年{month}月可安排日期一览 (空闲天数从多到少)")
+    print()
+    weekday_names = ['一', '二', '三', '四', '五', '六', '日']
+    header = f"{'设备编号':<10}{'型号':<14}{'空闲天':>6}  "
+    header += ' '.join(f"{w:>2}" for w in weekday_names)
+    print(header)
+    print('-' * (10 + 14 + 6 + 3 + 7 * 3))
+
+    for info in matrix['equipments']:
+        free_set = set(info['free_days'])
+        first_weekday = calendar.weekday(year, month, 1)
+        cells = []
+        for d in range(1, days + 1):
+            weekday = calendar.weekday(year, month, d)
+            if d in free_set:
+                cells.append(f"{d:>2}")
+            else:
+                cells.append(" ×")
+        row = f"{info['code']:<10}{info['model'][:12]:<14}{info['free_count']:>5}天  "
+        row += ' '.join(cells)
+        print(row)
+    print()
+    print("  ×=已占用/非空闲，数字=可安排日期")
+
+
+def settlement_menu():
+    while True:
+        print_header("结算与账单管理")
+        print_menu([
+            "查看结算明细 (按租赁ID)",
+            "查看客户账单汇总",
+            "查看全部结算单",
+            "按客户查询历史账单",
+            "查看未结清账单",
+            "记录收款",
+        ])
+        choice = input_int("请选择操作: ", 0, 6)
+        if choice == 0:
+            break
+        elif choice == 1:
+            rid = input_int("租赁ID: ", 1)
+            s = settlement_manager.get_settlement_by_rental_id(rid)
+            if s:
+                settlement_manager.print_settlement_detail(s)
+            else:
+                print("该租赁尚未生成结算单，请先完成设备归还")
+        elif choice == 2:
+            billings, grand = settlement_manager.get_customer_billing_summary()
+            print(f"\n📋 客户账单汇总")
+            print(f"{'客户名称':<28}{'单数':>6}{'应收总额':>14}{'已收':>14}{'未结清':>14}")
+            print("-" * 80)
+            for b in billings:
+                print(f"{b['customer_name'][:26]:<28}{b['bill_count']:>6}"
+                      f"¥{b['total_billed']:>12.2f}¥{b['total_paid']:>12.2f}¥{b['total_unpaid']:>12.2f}")
+            print("-" * 80)
+            print(f"{'合计':<28}{grand['bill_count']:>6}"
+                  f"¥{grand['total_billed']:>12.2f}¥{grand['total_paid']:>12.2f}¥{grand['total_unpaid']:>12.2f}")
+        elif choice == 3:
+            ps = input("收款状态筛选(未结清/已结清/部分结清, 留空全部): ").strip() or None
+            settlements = settlement_manager.list_settlements(payment_status=ps)
+            print_settlement_list(settlements)
+        elif choice == 4:
+            customers = rental_manager.list_customers()
+            print(f"{'ID':<6}{'客户名称':<32}")
+            print("-" * 40)
+            for c in customers:
+                print(f"{c['id']:<6}{c['name']:<32}")
+            cid = input_int("客户ID: ", 1)
+            settlements = settlement_manager.list_settlements(customer_id=cid)
+            c = rental_manager.get_customer_by_id(cid)
+            if c:
+                print(f"\n🧾 {c['name']} 的历史账单")
+            print_settlement_list(settlements)
+            if settlements:
+                billed = sum(s['total_amount'] or 0 for s in settlements)
+                paid = sum(s['paid_amount'] or 0 for s in settlements)
+                print(f"\n  累计应收: ¥{billed:.2f}   已收: ¥{paid:.2f}   未结清: ¥{billed - paid:.2f}")
+        elif choice == 5:
+            settlements = settlement_manager.list_settlements(payment_status='未结清')
+            settlements += settlement_manager.list_settlements(payment_status='部分结清')
+            settlements.sort(key=lambda x: x['settlement_date'])
+            print(f"\n⚠️  未结清账单 (共 {len(settlements)} 笔)")
+            print_settlement_list(settlements)
+            if settlements:
+                unpaid = sum((s['total_amount'] or 0) - (s['paid_amount'] or 0) for s in settlements)
+                print(f"\n  待收总额: ¥{unpaid:.2f}")
+        elif choice == 6:
+            sid = input_int("结算单ID: ", 1)
+            s = settlement_manager.get_settlement_by_id(sid)
+            if not s:
+                print("结算单不存在")
+                continue
+            remain = (s['total_amount'] or 0) - (s['paid_amount'] or 0)
+            print(f"当前未付: ¥{remain:.2f}")
+            amount = input_float("收款金额: ", 0.01)
+            remarks = input("备注(可选): ").strip()
+            ok, msg = settlement_manager.record_payment(sid, amount, remarks)
+            print(msg)
+
+
+def print_settlement_list(settlements):
+    if not settlements:
+        print("  暂无记录")
+        return
+    print(f"{'单号':<6}{'客户':<20}{'设备':<10}{'起租':<12}{'归还':<12}"
+          f"{'应收':>12}{'已收':>12}{'未付':>12}{'状态'}")
+    print("-" * 100)
+    for s in settlements:
+        unpaid = (s['total_amount'] or 0) - (s['paid_amount'] or 0)
+        print(f"{s['id']:<6}{(s['customer_name'] or '')[:18]:<20}{s['equipment_code']:<10}"
+              f"{s['start_date']:<12}{s['end_date']:<12}"
+              f"¥{s['total_amount'] or 0:>10.2f}"
+              f"¥{s['paid_amount'] or 0:>10.2f}"
+              f"¥{unpaid:>10.2f}  {s['payment_status']}")
+
+
 def equipment_menu():
     while True:
         print_header("设备管理")
@@ -126,12 +300,14 @@ def equipment_menu():
             "查看所有设备",
             "按类型/状态查看设备",
             "查看设备排期时间表",
+            "📅 月历式排期查询(单设备)",
+            "📊 按类型批量查看空闲日期",
             "保养提醒与待保养清单",
             "开始保养流程",
             "记录保养完成(含费用)",
             "查看保养记录/费用统计",
         ])
-        choice = input_int("请选择操作: ", 0, 8)
+        choice = input_int("请选择操作: ", 0, 10)
 
         if choice == 0:
             break
@@ -183,9 +359,15 @@ def equipment_menu():
                 print(f"\n  未来预约: {len(upcoming)} 条")
 
         elif choice == 5:
-            show_maintenance_alerts()
+            display_equipment_calendar()
 
         elif choice == 6:
+            display_type_availability()
+
+        elif choice == 7:
+            show_maintenance_alerts()
+
+        elif choice == 8:
             print("\n--- 开始保养 ---")
             code = input("设备编号: ").strip()
             eq = equipment_manager.get_equipment_by_code(code)
@@ -195,7 +377,7 @@ def equipment_menu():
             ok, msg = equipment_manager.start_maintenance(eq['id'])
             print(msg)
 
-        elif choice == 7:
+        elif choice == 9:
             print("\n--- 记录保养完成 ---")
             code = input("设备编号: ").strip()
             eq = equipment_manager.get_equipment_by_code(code)
@@ -222,7 +404,7 @@ def equipment_menu():
             else:
                 print(f"❌ {msg}")
 
-        elif choice == 8:
+        elif choice == 10:
             maintenance_cost_menu()
 
 
@@ -630,6 +812,7 @@ def process_return():
         not_before=r['start_date']
     )
     return_hours = input_float("归还时工时: ", min_val=r['start_hours'])
+    maintenance_remark = input("保养相关备注(如: 归还时发现滤芯需更换, 留空跳过): ").strip()
 
     fees = rental_manager.calculate_rental_fee(rid, actual_return_date, return_hours)
     if fees and 'error' in fees:
@@ -648,22 +831,27 @@ def process_return():
             print(f"  超期罚款: ¥{fees['overtime_fine']:.2f}")
         print(f"  总金额:   ¥{fees['total_amount']:.2f}")
 
-        confirm = input(f"\n确认归还? (y/n): ").strip().lower()
+        confirm = input(f"\n确认归还并生成结算单? (y/n): ").strip().lower()
         if confirm != 'y':
             print("已取消")
             return
 
-    ok, result = rental_manager.return_equipment(rid, actual_return_date, return_hours)
+    ok, result = rental_manager.return_equipment(rid, actual_return_date, return_hours, maintenance_remark)
     if ok and isinstance(result, dict) and 'error' not in result:
         print("\n✅ 归还成功！")
         eq_after = equipment_manager.get_equipment_by_id(r['equipment_id'])
         print(f"  设备状态: {eq_after['status']}")
         if eq_after['status'] == '待保养':
             print(f"  ⚠️  设备已到保养周期，已自动标记为待保养，请尽快安排保养！")
-        print(f"  基本租金: ¥{result['base_rent']:.2f}")
-        if result['overtime_fine'] > 0:
-            print(f"  超期罚款: ¥{result['overtime_fine']:.2f}")
-        print(f"  总金额:   ¥{result['total_amount']:.2f}")
+        settlement = result.get('settlement')
+        if settlement:
+            print(f"\n🧾 已自动生成结算单 #{settlement['id']}")
+            settlement_manager.print_settlement_detail(settlement)
+        else:
+            print(f"  基本租金: ¥{result['base_rent']:.2f}")
+            if result.get('overtime_fine', 0) > 0:
+                print(f"  超期罚款: ¥{result['overtime_fine']:.2f}")
+            print(f"  总金额:   ¥{result['total_amount']:.2f}")
     else:
         print(f"❌ 归还失败: {result}")
 
@@ -896,10 +1084,11 @@ def main():
             "客户管理",
             "预约排期管理",
             "租赁管理",
+            "🧾 结算与账单管理",
             "报表统计",
             "重新加载示例数据",
         ])
-        choice = input_int("请选择操作: ", 0, 6)
+        choice = input_int("请选择操作: ", 0, 7)
 
         if choice == 0:
             print("\n👋 感谢使用，再见！")
@@ -913,8 +1102,10 @@ def main():
         elif choice == 4:
             rental_menu()
         elif choice == 5:
-            report_menu()
+            settlement_menu()
         elif choice == 6:
+            report_menu()
+        elif choice == 7:
             confirm = input("确定重新加载示例数据? 这将覆盖所有现有数据 (y/n): ").strip().lower()
             if confirm == 'y':
                 if os.path.exists(db_path):

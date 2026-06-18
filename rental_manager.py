@@ -52,7 +52,8 @@ def search_customers(keyword):
 
 
 def create_rental(customer_id, equipment_id, start_date, expected_return_date,
-                  start_hours, rental_mode='按天', daily_rate=None, hourly_rate=None, remarks=''):
+                  start_hours, rental_mode='按天', daily_rate=None, hourly_rate=None,
+                  remarks='', exclude_reservation_id=None):
     equipment = equipment_manager.get_equipment_by_id(equipment_id)
     if not equipment:
         return False, None, "设备不存在"
@@ -66,7 +67,8 @@ def create_rental(customer_id, equipment_id, start_date, expected_return_date,
         return False, None, avail_msg
 
     ok, conflict_msg, _ = equipment_manager.check_time_conflicts(
-        equipment_id, start_date, expected_return_date
+        equipment_id, start_date, expected_return_date,
+        exclude_reservation_id=exclude_reservation_id
     )
     if not ok:
         return False, None, conflict_msg
@@ -84,8 +86,9 @@ def create_rental(customer_id, equipment_id, start_date, expected_return_date,
     try:
         cursor.execute('''
             INSERT INTO rental (customer_id, equipment_id, start_date, expected_return_date,
-                               start_hours, rental_mode, daily_rate, hourly_rate, status, remarks)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, '在租', ?)
+                               start_hours, rental_mode, daily_rate, hourly_rate, status, remarks,
+                               payment_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, '在租', ?, '未结清')
         ''', (customer_id, equipment_id, start_date, expected_return_date,
               start_hours, rental_mode, daily_rate, hourly_rate, remarks))
         cursor.execute('UPDATE equipment SET status = ? WHERE id = ?', ('在租', equipment_id))
@@ -143,7 +146,7 @@ def calculate_rental_fee(rental_id, actual_return_date, return_hours):
     }
 
 
-def return_equipment(rental_id, actual_return_date, return_hours):
+def return_equipment(rental_id, actual_return_date, return_hours, maintenance_remark=''):
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute('SELECT * FROM rental WHERE id = ?', (rental_id,))
@@ -187,15 +190,30 @@ def return_equipment(rental_id, actual_return_date, return_hours):
         hours_since = (return_hours or 0) - (eq['last_maintenance_hours'] or 0)
         needs_maint = hours_since >= eq['maintenance_interval']
         new_status = '待保养' if needs_maint else '空闲'
+        if needs_maint and maintenance_remark == '':
+            maintenance_remark = f"本次使用后已达保养周期(已累计{hours_since:.1f}h)，建议尽快保养"
 
         cursor.execute('UPDATE equipment SET status = ?, total_hours = ? WHERE id = ?',
                        (new_status, return_hours, eq_id))
         conn.commit()
-        return True, fees
     except Exception as e:
+        conn.close()
         return False, str(e)
     finally:
         conn.close()
+
+    try:
+        import settlement_manager
+        ok_s, settlement, _ = settlement_manager.generate_settlement_from_rental(
+            rental_id, maintenance_remark=maintenance_remark
+        )
+        if ok_s:
+            fees['settlement'] = settlement
+            fees['settlement_id'] = settlement['id']
+    except Exception:
+        pass
+
+    return True, fees
 
 
 def list_rentals(status=None, customer_id=None, equipment_id=None,

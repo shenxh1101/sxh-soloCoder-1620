@@ -4,6 +4,7 @@ import os
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rental.db')
 
 EQUIPMENT_STATUSES = ['空闲', '在租', '待保养', '保养中']
+PAYMENT_STATUSES = ['未结清', '已结清', '部分结清']
 
 
 def get_conn():
@@ -40,15 +41,63 @@ def _migrate(cursor):
                 expected_hourly_rate REAL,
                 rental_mode TEXT DEFAULT '按天',
                 status TEXT DEFAULT '待确认',
+                converted_rental_id INTEGER,
                 remarks TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (customer_id) REFERENCES customer(id),
                 FOREIGN KEY (equipment_id) REFERENCES equipment(id)
             )
         ''')
+    else:
+        if not _column_exists(cursor, 'reservation', 'converted_rental_id'):
+            cursor.execute('ALTER TABLE reservation ADD COLUMN converted_rental_id INTEGER')
+
+    if not _table_exists(cursor, 'settlement'):
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS settlement (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rental_id INTEGER NOT NULL UNIQUE,
+                customer_id INTEGER NOT NULL,
+                equipment_id INTEGER NOT NULL,
+                settlement_date TEXT NOT NULL,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                rental_days INTEGER NOT NULL,
+                start_hours REAL NOT NULL,
+                end_hours REAL NOT NULL,
+                used_hours REAL NOT NULL,
+                rental_mode TEXT NOT NULL,
+                daily_rate REAL,
+                hourly_rate REAL,
+                base_rent REAL NOT NULL,
+                overtime_days INTEGER DEFAULT 0,
+                overtime_hours REAL DEFAULT 0,
+                overtime_fine REAL DEFAULT 0,
+                maintenance_remark TEXT,
+                total_amount REAL NOT NULL,
+                paid_amount REAL DEFAULT 0,
+                payment_status TEXT DEFAULT '未结清',
+                remarks TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (rental_id) REFERENCES rental(id),
+                FOREIGN KEY (customer_id) REFERENCES customer(id),
+                FOREIGN KEY (equipment_id) REFERENCES equipment(id)
+            )
+        ''')
+
+    if not _column_exists(cursor, 'rental', 'settlement_id'):
+        cursor.execute('ALTER TABLE rental ADD COLUMN settlement_id INTEGER')
+    if not _column_exists(cursor, 'rental', 'payment_status'):
+        cursor.execute("ALTER TABLE rental ADD COLUMN payment_status TEXT DEFAULT '未结清'")
+        cursor.execute("UPDATE rental SET payment_status = '已结清' WHERE status = '已归还' AND total_amount > 0")
+        cursor.execute("UPDATE rental SET payment_status = '未结清' WHERE payment_status IS NULL")
+    if not _column_exists(cursor, 'reservation', 'customer_id'):
+        pass
 
     cursor.execute('UPDATE equipment SET status = ? WHERE status NOT IN (?, ?, ?, ?)',
                    ('空闲', '空闲', '在租', '待保养', '保养中'))
+
+    cursor.execute("UPDATE rental SET payment_status = '未结清' WHERE payment_status IS NULL OR payment_status = ''")
 
 
 def init_db():
@@ -97,6 +146,8 @@ def init_db():
             overtime_fine REAL DEFAULT 0,
             total_amount REAL DEFAULT 0,
             status TEXT DEFAULT '在租',
+            settlement_id INTEGER,
+            payment_status TEXT DEFAULT '未结清',
             remarks TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (customer_id) REFERENCES customer(id),

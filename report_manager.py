@@ -183,27 +183,50 @@ def get_utilization_report(year, month):
         rental_count = 0
         for r in eq_rentals:
             r_start = _parse_date(r['start_date'])
-            r_end_str = r['actual_return_date'] or (
-                min(_parse_date(r['expected_return_date']), effective_end).strftime('%Y-%m-%d')
-                if r['status'] == '在租' else r['expected_return_date']
-            )
-            r_end = _parse_date(r_end_str)
+            full_end_str = r['actual_return_date'] or r['expected_return_date']
+            r_full_end = _parse_date(full_end_str)
+            total_rental_days = (r_full_end - r_start).days + 1
+
+            overlap_start = max(r_start, month_start)
             if r['status'] == '在租':
-                r_end = min(r_end, effective_end)
-            overlap = _overlap_days(r_start, r_end, month_start, effective_end)
+                overlap_end = min(r_full_end, effective_end)
+            else:
+                overlap_end = min(r_full_end, month_end)
+            if overlap_end < overlap_start:
+                continue
+            overlap = (overlap_end - overlap_start).days + 1
             rented_days += overlap
+            rental_count += 1
+
+            if r['rental_mode'] == '按天':
+                daily = r['daily_rate'] or 0
+                month_income = overlap * daily
+            else:
+                hourly = r['hourly_rate'] or 0
+                month_income = overlap * 8 * hourly
+
             if r['status'] == '已归还':
-                income += r['total_amount'] or 0
-                rental_count += 1
-            elif r['status'] == '在租':
-                overlap_start = max(r_start, month_start)
-                overlap_end = r_end
-                days_in_overlap = (overlap_end - overlap_start).days + 1
-                if r['rental_mode'] == '按天':
-                    income += (days_in_overlap * (r['daily_rate'] or 0))
-                else:
-                    income += (days_in_overlap * 8 * (r['hourly_rate'] or 0))
-                rental_count += 1
+                overtime_fine = r['overtime_fine'] or 0
+                if overtime_fine > 0 and total_rental_days > 0:
+                    expected_days = equipment_manager.days_between(
+                        r['start_date'], r['expected_return_date']
+                    )
+                    actual_days = equipment_manager.days_between(
+                        r['start_date'], r['actual_return_date']
+                    )
+                    overtime_real_days = max(0, actual_days - expected_days)
+                    if overtime_real_days > 0:
+                        ot_overlap_start = max(
+                            overlap_start,
+                            _parse_date(r['expected_return_date'])
+                        )
+                        ot_overlap_end = overlap_end
+                        if ot_overlap_end >= ot_overlap_start:
+                            ot_overlap = (ot_overlap_end - ot_overlap_start).days + 1
+                            fine_per_day = overtime_fine / overtime_real_days
+                            month_income += round(ot_overlap * fine_per_day, 2)
+
+            income += round(month_income, 2)
 
         idle_days = days_in_month - rented_days
         utilization = (rented_days / days_in_month * 100) if days_in_month > 0 else 0
