@@ -3,12 +3,52 @@ import os
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rental.db')
 
+EQUIPMENT_STATUSES = ['空闲', '在租', '待保养', '保养中']
+
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def _table_exists(cursor, table_name):
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,)
+    )
+    return cursor.fetchone() is not None
+
+
+def _column_exists(cursor, table_name, column_name):
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    columns = [row[1] for row in cursor.fetchall()]
+    return column_name in columns
+
+
+def _migrate(cursor):
+    if not _table_exists(cursor, 'reservation'):
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS reservation (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                customer_id INTEGER NOT NULL,
+                equipment_id INTEGER NOT NULL,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                expected_daily_rate REAL,
+                expected_hourly_rate REAL,
+                rental_mode TEXT DEFAULT '按天',
+                status TEXT DEFAULT '待确认',
+                remarks TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (customer_id) REFERENCES customer(id),
+                FOREIGN KEY (equipment_id) REFERENCES equipment(id)
+            )
+        ''')
+
+    cursor.execute('UPDATE equipment SET status = ? WHERE status NOT IN (?, ?, ?, ?)',
+                   ('空闲', '空闲', '在租', '待保养', '保养中'))
 
 
 def init_db():
@@ -77,6 +117,8 @@ def init_db():
             FOREIGN KEY (equipment_id) REFERENCES equipment(id)
         )
     ''')
+
+    _migrate(cursor)
 
     conn.commit()
     conn.close()

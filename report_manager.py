@@ -1,8 +1,22 @@
 from database import get_conn
 from datetime import datetime
+import calendar
 import csv
 import os
 from equipment_manager import EQUIPMENT_TYPES
+import equipment_manager
+
+
+def _parse_date(s):
+    return datetime.strptime(s, '%Y-%m-%d').date()
+
+
+def _overlap_days(start1, end1, start2, end2):
+    s = max(start1, start2)
+    e = min(end1, end2)
+    if e < s:
+        return 0
+    return (e - s).days + 1
 
 
 def get_equipment_status_by_type():
@@ -14,9 +28,14 @@ def get_equipment_status_by_type():
         rented = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM equipment WHERE type = ? AND status = '空闲'", (eq_type,))
         idle = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM equipment WHERE type = ? AND status = '待保养'", (eq_type,))
+        maint_needed = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM equipment WHERE type = ? AND status = '保养中'", (eq_type,))
+        mainting = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM equipment WHERE type = ?", (eq_type,))
         total = cursor.fetchone()[0]
-        result[eq_type] = {'在租': rented, '空闲': idle, '总数': total}
+        result[eq_type] = {'在租': rented, '空闲': idle,
+                           '待保养': maint_needed, '保养中': mainting, '总数': total}
     conn.close()
     return result
 
@@ -125,8 +144,202 @@ def get_monthly_income_report(year, month):
     }
 
 
+def get_utilization_report(year, month):
+    _, days_in_month = calendar.monthrange(year, month)
+    month_start = _parse_date(f"{year}-{month:02d}-01")
+    month_end = _parse_date(f"{year}-{month:02d}-{days_in_month}")
+    today = datetime.now().date()
+    effective_end = min(month_end, today)
+
+    conn = get_conn()
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT * FROM equipment ORDER BY type, code')
+    all_eq = [dict(row) for row in cursor.fetchall()]
+
+    start_str = f"{year}-{month:02d}-01"
+    if month == 12:
+        end_str = f"{year + 1}-01-01"
+    else:
+        end_str = f"{year}-{month + 1:02d}-01"
+
+    cursor.execute('''
+        SELECT r.*, e.code as equipment_code, e.type as equipment_type, e.model as equipment_model
+        FROM rental r
+        LEFT JOIN equipment e ON r.equipment_id = e.id
+        WHERE r.status != '已取消'
+          AND r.start_date <= ?
+          AND (r.actual_return_date IS NULL OR r.actual_return_date >= ?)
+    ''', (end_str[:7] + "-31" if False else end_str, start_str))
+    all_rentals = [dict(row) for row in cursor.fetchall()]
+
+    conn.close()
+
+    per_equipment = []
+    for eq in all_eq:
+        eq_rentals = [r for r in all_rentals if r['equipment_id'] == eq['id']]
+        rented_days = 0
+        income = 0
+        rental_count = 0
+        for r in eq_rentals:
+            r_start = _parse_date(r['start_date'])
+            r_end_str = r['actual_return_date'] or (
+                min(_parse_date(r['expected_return_date']), effective_end).strftime('%Y-%m-%d')
+                if r['status'] == '在租' else r['expected_return_date']
+            )
+            r_end = _parse_date(r_end_str)
+            if r['status'] == '在租':
+                r_end = min(r_end, effective_end)
+            overlap = _overlap_days(r_start, r_end, month_start, effective_end)
+            rented_days += overlap
+            if r['status'] == '已归还':
+                income += r['total_amount'] or 0
+                rental_count += 1
+            elif r['status'] == '在租':
+                overlap_start = max(r_start, month_start)
+                overlap_end = r_end
+                days_in_overlap = (overlap_end - overlap_start).days + 1
+                if r['rental_mode'] == '按天':
+                    income += (days_in_overlap * (r['daily_rate'] or 0))
+                else:
+                    income += (days_in_overlap * 8 * (r['hourly_rate'] or 0))
+                rental_count += 1
+
+        idle_days = days_in_month - rented_days
+        utilization = (rented_days / days_in_month * 100) if days_in_month > 0 else 0
+
+        per_equipment.append({
+            'code': eq['code'],
+            'type': eq['type'],
+            'model': eq['model'],
+            'status': eq['status'],
+            'total_hours': eq['total_hours'] or 0,
+            'rented_days': rented_days,
+            'idle_days': max(0, idle_days),
+            'total_days': days_in_month,
+            'utilization': round(utilization, 2),
+            'rental_count': rental_count,
+            'income': round(income, 2),
+        })
+
+    per_type = {}
+    for item in per_equipment:
+        t = item['type']
+        if t not in per_type:
+            per_type[t] = {
+                'type': t,
+                'count': 0,
+                'total_rented_days': 0,
+                'total_idle_days': 0,
+                'total_income': 0,
+                'rental_count': 0,
+            }
+        per_type[t]['count'] += 1
+        per_type[t]['total_rented_days'] += item['rented_days']
+        per_type[t]['total_idle_days'] += item['idle_days']
+        per_type[t]['total_income'] += item['income']
+        per_type[t]['rental_count'] += item['rental_count']
+
+    type_list = []
+    for t, data in per_type.items():
+        total_avail_days = data['count'] * days_in_month
+        util = (data['total_rented_days'] / total_avail_days * 100) if total_avail_days > 0 else 0
+        type_list.append({
+            'type': t,
+            'count': data['count'],
+            'rented_days': data['total_rented_days'],
+            'idle_days': data['total_idle_days'],
+            'avg_rented_days': round(data['total_rented_days'] / data['count'], 1) if data['count'] else 0,
+            'utilization': round(util, 2),
+            'rental_count': data['rental_count'],
+            'income': round(data['total_income'], 2),
+        })
+    type_list.sort(key=lambda x: x['utilization'], reverse=True)
+
+    per_equipment.sort(key=lambda x: x['utilization'])
+
+    grand_total_rented = sum(i['rented_days'] for i in per_equipment)
+    grand_total_avail = len(per_equipment) * days_in_month
+    grand_total_income = sum(i['income'] for i in per_equipment)
+    grand_util = (grand_total_rented / grand_total_avail * 100) if grand_total_avail > 0 else 0
+
+    summary = {
+        'year': year,
+        'month': month,
+        'days_in_month': days_in_month,
+        'equipment_count': len(per_equipment),
+        'total_rented_days': grand_total_rented,
+        'total_available_days': grand_total_avail,
+        'total_income': round(grand_total_income, 2),
+        'avg_utilization': round(grand_util, 2),
+    }
+
+    return {
+        'summary': summary,
+        'by_type': type_list,
+        'by_equipment': per_equipment,
+    }
+
+
+def export_utilization_report_to_csv(year, month, output_dir=None):
+    report = get_utilization_report(year, month)
+    if output_dir is None:
+        output_dir = os.path.dirname(os.path.abspath(__file__))
+    filename = f"设备利用率报表_{year}年{month:02d}月.csv"
+    filepath = os.path.join(output_dir, filename)
+
+    with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        s = report['summary']
+        writer.writerow([f"设备利用率报表 - {year}年{month}月"])
+        writer.writerow([])
+        writer.writerow(['总体概况'])
+        writer.writerow(['指标', '数值'])
+        writer.writerow(['统计天数', f"{s['days_in_month']} 天"])
+        writer.writerow(['设备总数', s['equipment_count']])
+        writer.writerow(['总可用设备天数', f"{s['total_available_days']} 台天"])
+        writer.writerow(['实际出租台天数', f"{s['total_rented_days']} 台天"])
+        writer.writerow(['累计收入', f"¥{s['total_income']:.2f}"])
+        writer.writerow(['整体平均利用率', f"{s['avg_utilization']:.2f}%"])
+        writer.writerow([])
+
+        writer.writerow(['按设备类型汇总 (利用率从高到低)'])
+        writer.writerow([
+            '设备类型', '台数', '出租台天', '空闲台天', '平均出租天数/台',
+            '类型利用率', '租赁次数', '收入'
+        ])
+        for t in report['by_type']:
+            writer.writerow([
+                t['type'], t['count'], t['rented_days'], t['idle_days'],
+                t['avg_rented_days'], f"{t['utilization']:.2f}%",
+                t['rental_count'], f"¥{t['income']:.2f}"
+            ])
+        writer.writerow([])
+
+        writer.writerow(['单台设备明细 (利用率从低到高，方便识别闲置)'])
+        writer.writerow([
+            '设备编号', '类型', '型号', '当前状态', '累计工时',
+            '出租天数', '空闲天数', '利用率', '租赁次数', '收入', '闲置提示'
+        ])
+        for e in report['by_equipment']:
+            tip = ''
+            if e['utilization'] < 20:
+                tip = '严重闲置⚠️'
+            elif e['utilization'] < 40:
+                tip = '使用率偏低'
+            elif e['utilization'] >= 80:
+                tip = '高负荷'
+            writer.writerow([
+                e['code'], e['type'], e['model'], e['status'], f"{e['total_hours']:.1f}h",
+                e['rented_days'], e['idle_days'], f"{e['utilization']:.2f}%",
+                e['rental_count'], f"¥{e['income']:.2f}", tip
+            ])
+    return filepath
+
+
 def export_monthly_report_to_csv(year, month, output_dir=None):
     report = get_monthly_income_report(year, month)
+    util_report = get_utilization_report(year, month)
     if output_dir is None:
         output_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -159,13 +372,25 @@ def export_monthly_report_to_csv(year, month, output_dir=None):
             ])
         writer.writerow([])
 
-        writer.writerow(['按设备类型汇总'])
+        writer.writerow(['按设备类型汇总(收入)'])
         writer.writerow(['设备类型', '租赁次数', '总收入'])
         for item in report['by_type']:
             writer.writerow([
                 item['设备类型'],
                 item['租赁次数'],
                 f"¥{item['总收入']:.2f}"
+            ])
+        writer.writerow([])
+
+        writer.writerow([
+            '设备利用率汇总',
+            f"(整体利用率 {util_report['summary']['avg_utilization']:.2f}%)"
+        ])
+        writer.writerow(['设备类型', '台数', '出租台天', '类型利用率', '收入'])
+        for t in util_report['by_type']:
+            writer.writerow([
+                t['type'], t['count'], t['rented_days'],
+                f"{t['utilization']:.2f}%", f"¥{t['income']:.2f}"
             ])
         writer.writerow([])
 
@@ -212,9 +437,10 @@ def export_daily_report_to_csv(report_date=None, output_dir=None):
         writer.writerow([])
 
         writer.writerow(['按设备类型统计'])
-        writer.writerow(['设备类型', '总数', '在租', '空闲'])
+        writer.writerow(['设备类型', '总数', '在租', '空闲', '待保养', '保养中'])
         for eq_type, stats in report['type_stats'].items():
-            writer.writerow([eq_type, stats['总数'], stats['在租'], stats['空闲']])
+            writer.writerow([eq_type, stats['总数'], stats['在租'], stats['空闲'],
+                             stats['待保养'], stats['保养中']])
         writer.writerow([])
 
         writer.writerow(['设备明细'])
